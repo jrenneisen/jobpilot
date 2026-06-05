@@ -121,13 +121,13 @@ def _map_kaggle_columns(df: pd.DataFrame) -> pd.DataFrame:
 #        --header 'x-rapidapi-key: YOUR_KEY'
 # ─────────────────────────────────────────────────────────────────────────────
 
-JSEARCH_BASE_URL = "https://jsearch.p.rapidapi.com"
+JSEARCH_BASE_URL = "https://jsearch-mega.p.rapidapi.com"
 
 def _jsearch_headers() -> dict:
-    """Return the RapidAPI headers required for every JSearch request."""
+    """Return the RapidAPI headers required for every JSearch Mega request."""
     return {
         "x-rapidapi-key":  JSEARCH_API_KEY,
-        "x-rapidapi-host": "jsearch.p.rapidapi.com",
+        "x-rapidapi-host": "jsearch-mega.p.rapidapi.com",
         "Content-Type":    "application/json",
     }
 
