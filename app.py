@@ -21,6 +21,18 @@ from src.utils import (
     OPENAI_API_KEY, JSEARCH_API_KEY, logger
 )
 
+# ─── Init database on startup ─────────────────────────────────────────────────
+from src.storage import (
+    init_db, create_or_update_user, get_user, list_users, delete_user,
+    save_profile, load_profile,
+    save_feedback_event, load_feedback_history, get_feedback_summary,
+    save_bandit_state, load_bandit_state, replay_feedback_into_bandit,
+    save_ranking_weights, load_ranking_weights,
+    save_resume, load_resumes,
+    get_learning_insights, db_size_kb,
+)
+init_db()
+
 # ─── Page config ──────────────────────────────────────────────────────────────
 st.set_page_config(
     page_title="JobPilot — Smart Job Matcher",
@@ -150,6 +162,7 @@ footer { visibility: hidden; }
 def init_session():
     defaults = {
         "page":             "🏠 Profile Setup",
+        "current_user":     None,    # logged-in user_id string
         "profile":          None,
         "jobs_df":          None,
         "faiss_index":      None,
@@ -165,6 +178,8 @@ def init_session():
         "data_stats":       {},
         "tfidf_candidates": [],
         "emb_candidates":   [],
+        "hybrid_candidates":[],
+        "cluster_labels":   None,   # K-Means job family clusters (ndarray)
         "positive_ids":     set(),
     }
     for k, v in defaults.items():
@@ -172,6 +187,78 @@ def init_session():
             st.session_state[k] = v
 
 init_session()
+
+
+# ─── Login / logout helpers ───────────────────────────────────────────────────
+def _login_user(user_id: str):
+    """
+    Load all persisted state for a user into session_state.
+    Restores: profile, feedback dict, resumes, bandit arms, ranking weights.
+    Replays full feedback history through the adaptive learner so the model
+    continues improving exactly where it left off.
+    """
+    from src.adaptive_learning import AdaptiveLearner
+
+    create_or_update_user(user_id, user_id.replace("_", " ").title())
+    st.session_state.current_user = user_id
+
+    # ── Profile ───────────────────────────────────────────────────────────────
+    saved_profile = load_profile(user_id)
+    if saved_profile:
+        st.session_state.profile = saved_profile
+        st.toast(f"✅ Welcome back! Profile loaded.")
+
+    # ── Feedback dict (for current-session display) ────────────────────────────
+    history = load_feedback_history(user_id)
+    st.session_state.feedback = {
+        e["job_id"]: e["feedback_type"] for e in history
+    }
+
+    # ── Positive IDs set ──────────────────────────────────────────────────────
+    st.session_state.positive_ids = {
+        e["job_id"] for e in history
+        if e["feedback_type"] in ("good", "save")
+    }
+
+    # ── Adaptive learner — restore + replay ───────────────────────────────────
+    weights  = load_ranking_weights(user_id)
+    adaptive = AdaptiveLearner(initial_weights=weights)
+
+    # Load saved arm distributions
+    adaptive.bandit = load_bandit_state(user_id, adaptive.bandit)
+
+    # If arms were empty (first replay), replay history chronologically
+    if not adaptive.bandit.arms and history:
+        adaptive.bandit, adaptive.updater = replay_feedback_into_bandit(
+            user_id, adaptive.bandit, adaptive.updater
+        )
+
+    st.session_state.adaptive = adaptive
+
+    # ── Cached resumes ────────────────────────────────────────────────────────
+    st.session_state.resumes = load_resumes(user_id)
+
+    logger.info(
+        f"Login: {user_id} — {len(history)} feedback events, "
+        f"{len(adaptive.bandit.arms)} bandit arms restored"
+    )
+
+
+def _save_session_to_db():
+    """
+    Persist current session state to database.
+    Called automatically on logout and after every feedback event.
+    """
+    uid = st.session_state.current_user
+    if not uid:
+        return
+
+    if st.session_state.profile:
+        save_profile(uid, st.session_state.profile)
+
+    if st.session_state.adaptive:
+        save_bandit_state(uid, st.session_state.adaptive.bandit)
+        save_ranking_weights(uid, st.session_state.adaptive.weights)
 
 
 # ─── PDF extraction helper ────────────────────────────────────────────────────
@@ -236,48 +323,109 @@ def _extract_pdf_text(uploaded_file) -> str:
         return ""
 
 
-# ─── Sidebar navigation ────────────────────────────────────────────────────────
+# ─── Sidebar ──────────────────────────────────────────────────────────────────
 with st.sidebar:
     st.markdown("""
-    <div style="text-align:center; padding: 10px 0 20px;">
+    <div style="text-align:center; padding: 10px 0 16px;">
         <div style="font-size:2.5rem;">🚀</div>
         <div style="font-size:1.4rem; font-weight:800; letter-spacing:1px;">JobPilot</div>
         <div style="font-size:0.78rem; opacity:0.8;">Smart Job Matcher</div>
     </div>
     """, unsafe_allow_html=True)
 
+    # ── User login ────────────────────────────────────────────────────────────
+    st.markdown("**👤 User Account**")
+    existing_users = list_users()
+    user_names     = [u["display_name"] for u in existing_users]
+
+    login_mode = st.radio("", ["Existing user", "New user"],
+                          horizontal=True, label_visibility="collapsed")
+
+    if login_mode == "New user":
+        new_name = st.text_input("Your name", placeholder="e.g. Jacob R.")
+        if st.button("Create Account", use_container_width=True, type="primary"):
+            if new_name.strip():
+                uid = new_name.strip().lower().replace(" ", "_")
+                create_or_update_user(uid, new_name.strip())
+                _login_user(uid)
+                st.rerun()
+            else:
+                st.warning("Enter a name first.")
+    else:
+        if user_names:
+            chosen = st.selectbox("Select account", user_names,
+                                  label_visibility="collapsed")
+            if st.button("Log In", use_container_width=True, type="primary"):
+                uid = next(u["user_id"] for u in existing_users
+                           if u["display_name"] == chosen)
+                _login_user(uid)
+                st.rerun()
+        else:
+            st.caption("No accounts yet — create one above.")
+
+    # Show logged-in user
+    if st.session_state.current_user:
+        u = get_user(st.session_state.current_user)
+        fb_summary = get_feedback_summary(st.session_state.current_user)
+        total_fb   = sum(
+            v["count"] for v in fb_summary.values()
+            if isinstance(v, dict) and "count" in v
+        )
+        st.markdown(f"""
+        <div style="background:rgba(255,255,255,0.12); border-radius:8px;
+                    padding:10px 12px; margin:8px 0;">
+            <div style="font-weight:700;">✅ {u['display_name']}</div>
+            <div style="font-size:0.75rem; opacity:0.8;">
+                {total_fb} feedback events saved<br>
+                Last seen: {u['last_seen'][:10]}
+            </div>
+        </div>
+        """, unsafe_allow_html=True)
+
+        if st.button("🚪 Log Out", use_container_width=True):
+            _save_session_to_db()
+            st.session_state.current_user = None
+            st.session_state.profile      = None
+            st.session_state.ranked_jobs  = []
+            st.session_state.feedback     = {}
+            st.session_state.adaptive     = None
+            st.session_state.resumes      = {}
+            st.session_state.pipeline_ready = False
+            st.rerun()
+
+    st.divider()
+
+    # ── Navigation ────────────────────────────────────────────────────────────
     pages = [
         "🏠 Profile Setup",
         "🎯 Job Matches",
         "📄 Resume Generator",
         "📊 Market Analytics",
         "📈 Benchmarks",
+        "🧠 My Learning Profile",
     ]
-    page = st.radio("", pages, key="nav_radio",
-                    index=pages.index(st.session_state.page))
+    page = st.radio("Navigate", pages, key="nav_radio",
+                    index=pages.index(st.session_state.page)
+                    if st.session_state.page in pages else 0)
     st.session_state.page = page
 
     st.divider()
 
-    # Status indicators
-    st.markdown("**System Status**")
-    pipeline_ok = st.session_state.pipeline_ready
-    profile_ok  = st.session_state.profile is not None
-    matches_ok  = len(st.session_state.ranked_jobs) > 0
-
+    # ── Status indicators ─────────────────────────────────────────────────────
     def _status(ok, label):
-        icon = "✅" if ok else "⚪"
-        st.markdown(f"{icon} {label}")
+        st.markdown(f"{'✅' if ok else '⚪'} {label}")
 
-    _status(profile_ok,  "Profile loaded")
-    _status(pipeline_ok, "Data pipeline ready")
-    _status(matches_ok,  "Jobs ranked")
-    _status(bool(OPENAI_API_KEY), "AI resume enabled")
-    _status(bool(JSEARCH_API_KEY), "Live jobs enabled")
+    _status(st.session_state.current_user is not None, "Logged in")
+    _status(st.session_state.profile is not None,      "Profile loaded")
+    _status(st.session_state.pipeline_ready,           "Pipeline ready")
+    _status(len(st.session_state.ranked_jobs) > 0,     "Jobs ranked")
+    _status(bool(OPENAI_API_KEY),                      "AI resume enabled")
+    _status(bool(JSEARCH_API_KEY),                     "Live jobs enabled")
 
     st.divider()
     st.markdown(
-        "<div style='font-size:0.72rem; opacity:0.7;'>BAX-423 · Spring 2026</div>",
+        f"<div style='font-size:0.70rem; opacity:0.6;'>"
+        f"BAX-423 · Spring 2026<br>DB: {db_size_kb()} KB</div>",
         unsafe_allow_html=True
     )
 
@@ -413,7 +561,13 @@ def page_profile():
             }
             st.session_state.pipeline_ready = False
             st.session_state.ranked_jobs = []
-            st.success("✅ Profile saved!")
+            # Persist to database if logged in
+            uid = st.session_state.current_user
+            if uid:
+                save_profile(uid, st.session_state.profile)
+                st.success("✅ Profile saved and stored to your account!")
+            else:
+                st.success("✅ Profile saved! Log in to keep it permanently.")
 
     # ── Current profile preview ───────────────────────────────────────────────
     if st.session_state.profile:
@@ -519,21 +673,54 @@ def _run_full_pipeline(data_source: str, live_queries: str | None):
             st.session_state.data_stats = dedup_stats
             progress.progress(50)
 
-            # ── Step 3: Build FAISS index ──────────────────────────────────
-            status.text("🧠 Step 3/5: Building embedding index (FAISS)...")
-            from src.embeddings import load_or_build_index, retrieve_candidates, tfidf_retrieve
+            # ── Step 3: Build FAISS index + job clusters ───────────────────
+            status.text("🧠 Step 3/5: Building embedding index (FAISS) + job clusters...")
+            from src.embeddings import (
+                load_or_build_index, build_job_clusters, get_cluster_labels,
+                get_preferred_clusters, retrieve_candidates, retrieve_hybrid,
+                tfidf_retrieve,
+            )
             index, embeddings, job_ids = load_or_build_index(jobs_df)
             st.session_state.faiss_index = index
             st.session_state.job_ids     = job_ids
             st.session_state.jobs_df     = jobs_df
+
+            # Build (or load cached) K-Means job family clusters from corpus
+            cluster_labels = get_cluster_labels(job_ids)
+            if cluster_labels is None:
+                cluster_labels = build_job_clusters(embeddings, job_ids)
+            st.session_state.cluster_labels = cluster_labels
             progress.progress(70)
 
-            # ── Step 4: Retrieve candidates ────────────────────────────────
-            status.text("🔎 Step 4/5: Retrieving top candidates...")
-            emb_candidates   = retrieve_candidates(profile, index, job_ids, k=RETRIEVAL_K)
+            # ── Step 4: Hybrid retrieval (FAISS + TF-IDF via RRF) ─────────
+            status.text("🔎 Step 4/5: Hybrid retrieval (dense + sparse + cluster boost)...")
+
+            # Derive preferred / avoided job families from prior feedback
+            preferred_clusters, avoided_clusters = set(), set()
+            if st.session_state.feedback and cluster_labels is not None:
+                preferred_clusters, avoided_clusters = get_preferred_clusters(
+                    st.session_state.feedback, job_ids, cluster_labels
+                )
+
+            hybrid_candidates = retrieve_hybrid(
+                profile, index, job_ids, jobs_df,
+                k=RETRIEVAL_K,
+                cluster_labels=cluster_labels,
+                preferred_clusters=preferred_clusters,
+                avoided_clusters=avoided_clusters,
+            )
+            # Keep pure dense + sparse for benchmarking
+            emb_candidates   = retrieve_candidates(
+                profile, index, job_ids, k=RETRIEVAL_K,
+                cluster_labels=cluster_labels,
+                preferred_clusters=preferred_clusters,
+                avoided_clusters=avoided_clusters,
+            )
             tfidf_candidates = tfidf_retrieve(profile, jobs_df, k=RETRIEVAL_K)
-            st.session_state.emb_candidates   = emb_candidates
-            st.session_state.tfidf_candidates = tfidf_candidates
+
+            st.session_state.hybrid_candidates  = hybrid_candidates
+            st.session_state.emb_candidates     = emb_candidates
+            st.session_state.tfidf_candidates   = tfidf_candidates
             progress.progress(85)
 
             # ── Step 5: Rank ───────────────────────────────────────────────
@@ -545,11 +732,12 @@ def _run_full_pipeline(data_source: str, live_queries: str | None):
                 st.session_state.adaptive = AdaptiveLearner()
 
             ranked = rank_jobs(
-                jobs_df, profile, emb_candidates,
+                jobs_df, profile,
+                hybrid_candidates,          # use RRF-fused candidates for ranking
                 weights=st.session_state.adaptive.weights,
                 feedback=st.session_state.feedback,
             )
-            st.session_state.ranked_jobs  = ranked
+            st.session_state.ranked_jobs    = ranked
             st.session_state.pipeline_ready = True
             progress.progress(100)
 
@@ -557,12 +745,17 @@ def _run_full_pipeline(data_source: str, live_queries: str | None):
             from src.analytics import get_full_analytics
             st.session_state.analytics = get_full_analytics(jobs_df, profile)
 
-            # Benchmark data
+            # Benchmark data (passes cluster_labels so hybrid column is accurate)
             from src.ranker import benchmark_ranking
             from src.embeddings import benchmark_retrieval
             st.session_state.benchmark_data = {
-                "retrieval": benchmark_retrieval(profile, jobs_df, index, job_ids),
-                "ranking":   benchmark_ranking(jobs_df, profile, emb_candidates, tfidf_candidates),
+                "retrieval": benchmark_retrieval(
+                    profile, jobs_df, index, job_ids,
+                    cluster_labels=cluster_labels,
+                ),
+                "ranking": benchmark_ranking(
+                    jobs_df, profile, hybrid_candidates, tfidf_candidates
+                ),
             }
 
             status.empty()
@@ -607,6 +800,28 @@ def page_matches():
         st.metric("Remote Positions", remote_count)
 
     st.divider()
+
+    # ── Data source warning ───────────────────────────────────────────────────
+    sources = {j.source for j in ranked}
+    if "synthetic" in sources:
+        real_count = sum(1 for j in ranked if j.source != "synthetic")
+        synth_count = sum(1 for j in ranked if j.source == "synthetic")
+        st.warning(
+            f"⚠️ **Data notice:** {synth_count} of your {len(ranked)} results are "
+            f"**synthetic** (generated fallback — Kaggle credentials not configured). "
+            f"{real_count} are live jobs from JSearch. "
+            f"To see only real jobs, add `KAGGLE_USERNAME` and `KAGGLE_KEY` to your "
+            f"Streamlit secrets, or ensure your `JSEARCH_API_KEY` is active.",
+            icon="⚠️",
+        )
+    else:
+        live_kaggle = sum(1 for j in ranked if j.source == "kaggle")
+        live_jsearch = sum(1 for j in ranked if j.source == "jsearch")
+        source_parts = []
+        if live_kaggle:  source_parts.append(f"{live_kaggle} from Kaggle corpus")
+        if live_jsearch: source_parts.append(f"{live_jsearch} live from JSearch API")
+        if source_parts:
+            st.success(f"✅ All results are real job postings — {', '.join(source_parts)}.")
 
     # ── Filters ───────────────────────────────────────────────────────────────
     with st.expander("🔧 Filter Results", expanded=False):
@@ -657,22 +872,39 @@ def page_matches():
         _render_job_card(job, profile, adaptive, feedback)
 
     # Re-rank after feedback
-    if st.button("🔄 Re-rank with Feedback", type="secondary", use_container_width=False):
-        from src.ranker import rank_jobs
-        ranked_new = rank_jobs(
-            st.session_state.jobs_df,
-            profile,
-            st.session_state.emb_candidates,
-            weights=adaptive.weights if adaptive else None,
-            feedback=feedback,
+    st.markdown("---")
+    rcol1, rcol2 = st.columns([2, 1])
+    with rcol1:
+        st.caption(
+            "💡 Rate jobs with 👍 / 💾 / 👎 above, then click **Re-rank** to see "
+            "the adaptive model reprioritise your top 20 based on your preferences."
         )
-        if adaptive:
-            ranked_new = adaptive.apply_bandit_boost(ranked_new)
-            ranked_new.sort(key=lambda j: j.final_score, reverse=True)
-            for i, j in enumerate(ranked_new):
-                j.rank = i + 1
-        st.session_state.ranked_jobs = ranked_new
-        st.rerun()
+    with rcol2:
+        if st.button("🔄 Re-rank with Feedback", type="primary", use_container_width=True):
+            from src.ranker import rank_jobs
+            # Use hybrid candidates (FAISS + TF-IDF RRF) — same as initial pipeline
+            candidates = (st.session_state.hybrid_candidates
+                          or st.session_state.emb_candidates)
+            ranked_new = rank_jobs(
+                st.session_state.jobs_df,
+                profile,
+                candidates,
+                weights=adaptive.weights if adaptive else None,
+                feedback=feedback,
+            )
+            if adaptive:
+                ranked_new = adaptive.apply_bandit_boost(ranked_new)
+                ranked_new.sort(key=lambda j: j.final_score, reverse=True)
+                for i, j in enumerate(ranked_new):
+                    j.rank = i + 1
+            # Show a diff summary: how many positions changed
+            old_ids = [j.job_id for j in st.session_state.ranked_jobs]
+            new_ids = [j.job_id for j in ranked_new]
+            moved   = sum(1 for i, jid in enumerate(new_ids)
+                          if i < len(old_ids) and jid != old_ids[i])
+            st.session_state.ranked_jobs = ranked_new
+            st.success(f"✅ Re-ranked! **{moved}** positions changed in the top {len(ranked_new)}.")
+            st.rerun()
 
 
 def _render_job_card(job, profile, adaptive, feedback):
@@ -682,6 +914,17 @@ def _render_job_card(job, profile, adaptive, feedback):
     score_pct = int(job.final_score * 100)
     score_class = "score-high" if score_pct >= 70 else "score-mid" if score_pct >= 45 else "score-low"
 
+    # Source badge
+    source_badge_map = {
+        "jsearch":   ('<span style="background:#27AE60;color:white;padding:2px 8px;'
+                      'border-radius:4px;font-size:0.72rem;font-weight:600;">🟢 LIVE</span>'),
+        "kaggle":    ('<span style="background:#2E75B6;color:white;padding:2px 8px;'
+                      'border-radius:4px;font-size:0.72rem;font-weight:600;">📦 KAGGLE</span>'),
+        "synthetic": ('<span style="background:#E67E22;color:white;padding:2px 8px;'
+                      'border-radius:4px;font-size:0.72rem;font-weight:600;">🔶 DEMO</span>'),
+    }
+    src_badge = source_badge_map.get(job.source, "")
+
     with st.container():
         st.markdown(f"""
         <div class="job-card" style="border-left-color:{border_color}">
@@ -690,6 +933,7 @@ def _render_job_card(job, profile, adaptive, feedback):
               <span style="font-size:1.1rem; font-weight:700; color:#1F4E79;">
                 #{job.rank} {job.title}
               </span>
+              &nbsp;{src_badge}
               <br>
               <span style="color:#5D6D7E; font-size:0.88rem;">
                 🏢 {job.company} &nbsp;|&nbsp;
@@ -797,18 +1041,29 @@ def _render_job_card(job, profile, adaptive, feedback):
 
 
 def _record_feedback(job, feedback_type, adaptive):
-    """Record feedback and update adaptive learner."""
+    """
+    Record feedback, update adaptive learner, and persist to database.
+    Every click is saved immediately — nothing is lost on refresh.
+    """
     st.session_state.feedback[job.job_id] = feedback_type
+
     if adaptive:
         adaptive.record_feedback(job, feedback_type)
         if feedback_type in ("good", "save"):
             st.session_state.positive_ids.add(job.job_id)
-        # Record precision every 5 events
         if adaptive.bandit.total_interactions % 5 == 0 and st.session_state.ranked_jobs:
             adaptive.record_precision(
                 st.session_state.ranked_jobs,
                 st.session_state.positive_ids
             )
+
+    # ── Persist to SQLite ─────────────────────────────────────────────────────
+    uid = st.session_state.current_user
+    if uid:
+        save_feedback_event(uid, job, feedback_type)          # log the event
+        save_bandit_state(uid, adaptive.bandit)               # save arm distributions
+        save_ranking_weights(uid, adaptive.weights)           # save updated weights
+
     st.rerun()
 
 
@@ -848,6 +1103,10 @@ def page_resume():
                 from src.resume_generator import generate_resume
                 result = generate_resume(profile, selected_job)
                 st.session_state.resumes[selected_job.job_id] = result
+                # Persist resume to database
+                uid = st.session_state.current_user
+                if uid:
+                    save_resume(uid, selected_job, result)
 
         # Display result
         st.markdown(f"""
@@ -1179,14 +1438,179 @@ def page_benchmarks():
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# PAGE 6 — MY LEARNING PROFILE
+# ══════════════════════════════════════════════════════════════════════════════
+def page_learning_profile():
+    st.markdown('<div class="section-header">🧠 My Learning Profile</div>',
+                unsafe_allow_html=True)
+
+    uid = st.session_state.current_user
+    if not uid:
+        st.warning("⚠️ Log in first to see your learning profile.")
+        return
+
+    insights = get_learning_insights(uid)
+    fb_summary = get_feedback_summary(uid)
+    adaptive = st.session_state.adaptive
+
+    if not insights:
+        st.info("No feedback recorded yet. Rate some jobs on the Job Matches page "
+                "and come back here to see what the model has learned about you.")
+        return
+
+    # ── Summary metrics ───────────────────────────────────────────────────────
+    col1, col2, col3, col4 = st.columns(4)
+    with col1:
+        st.markdown(f'<div class="metric-card"><div class="metric-number">'
+                    f'{insights["total_feedback"]}</div>'
+                    f'<div class="metric-label">Total Feedback Events</div></div>',
+                    unsafe_allow_html=True)
+    with col2:
+        st.markdown(f'<div class="metric-card"><div class="metric-number">'
+                    f'{insights["liked_count"]}</div>'
+                    f'<div class="metric-label">Jobs Liked / Saved</div></div>',
+                    unsafe_allow_html=True)
+    with col3:
+        st.markdown(f'<div class="metric-card"><div class="metric-number">'
+                    f'{insights["sessions_count"]}</div>'
+                    f'<div class="metric-label">Sessions Recorded</div></div>',
+                    unsafe_allow_html=True)
+    with col4:
+        arms = len(adaptive.bandit.arms) if adaptive else 0
+        st.markdown(f'<div class="metric-card"><div class="metric-number">'
+                    f'{arms}</div>'
+                    f'<div class="metric-label">Preference Clusters Learned</div></div>',
+                    unsafe_allow_html=True)
+
+    st.markdown("")
+    col_l, col_r = st.columns(2)
+
+    # ── What the model has learned ────────────────────────────────────────────
+    with col_l:
+        st.markdown("### ✅ What You Tend to Like")
+
+        if insights["preferred_seniority"]:
+            st.markdown("**Seniority levels:**")
+            for level, count in insights["preferred_seniority"]:
+                st.markdown(f"- {level.title()} ({count} likes)")
+
+        if insights["preferred_industry"]:
+            st.markdown("**Industries:**")
+            for ind, count in insights["preferred_industry"]:
+                st.markdown(f"- {ind.replace('_',' ').title()} ({count} likes)")
+
+        if insights["top_matched_skills"]:
+            st.markdown("**Most valued skills (in liked jobs):**")
+            pills = " ".join(
+                f'<span class="skill-pill skill-matched">{s}</span>'
+                for s, _ in insights["top_matched_skills"]
+            )
+            st.markdown(f'<div>{pills}</div>', unsafe_allow_html=True)
+
+        if fb_summary.get("top_liked_companies"):
+            st.markdown("**Companies you liked:**")
+            for co in fb_summary["top_liked_companies"]:
+                st.markdown(f"- {co}")
+
+    with col_r:
+        st.markdown("### ❌ What the Model Avoids for You")
+
+        if insights["avoided_seniority"]:
+            st.markdown("**Seniority levels:**")
+            for level, count in insights["avoided_seniority"]:
+                st.markdown(f"- {level.title()} ({count} dislikes)")
+
+        if insights["avoided_industry"]:
+            st.markdown("**Industries:**")
+            for ind, count in insights["avoided_industry"]:
+                st.markdown(f"- {ind.replace('_',' ').title()} ({count} dislikes)")
+
+        if fb_summary.get("disliked_patterns"):
+            st.markdown("**Disliked patterns:**")
+            for p in fb_summary["disliked_patterns"][:3]:
+                st.markdown(f"- {p['seniority'].title()} {p['industry'].replace('_',' ')} roles")
+
+    st.divider()
+
+    # ── Current ranking weights ───────────────────────────────────────────────
+    st.markdown("### ⚖️ Your Personalised Ranking Weights")
+    st.caption("These weights shift based on your feedback — the model "
+               "emphasises the dimensions that best predict your preferences.")
+
+    if adaptive:
+        weights = adaptive.weights
+        from src.utils import DEFAULT_WEIGHTS
+        w_data = []
+        for k, v in weights.items():
+            default = DEFAULT_WEIGHTS.get(k, 0)
+            delta   = v - default
+            arrow   = "⬆️" if delta > 0.005 else ("⬇️" if delta < -0.005 else "➡️")
+            w_data.append({
+                "Dimension":   k.replace("_", " ").title(),
+                "Default":     f"{default:.2f}",
+                "Your Weight": f"{v:.2f}",
+                "Change":      f"{arrow} {delta:+.3f}",
+            })
+        st.dataframe(pd.DataFrame(w_data), hide_index=True, use_container_width=True)
+
+    # ── Full feedback history ─────────────────────────────────────────────────
+    st.divider()
+    st.markdown("### 📋 Full Feedback History")
+
+    history = load_feedback_history(uid)
+    if history:
+        hist_df = pd.DataFrame([{
+            "Date":      h["recorded_at"][:10],
+            "Job Title": h["job_title"],
+            "Company":   h["company"],
+            "Feedback":  h["feedback_type"].title(),
+            "Score":     f"{h['final_score']:.2f}" if h["final_score"] else "—",
+        } for h in history])
+
+        fb_filter = st.multiselect(
+            "Filter by feedback type",
+            ["Good", "Bad", "Save", "Skip"],
+            default=["Good", "Save", "Bad", "Skip"],
+        )
+        filtered_hist = hist_df[hist_df["Feedback"].isin(fb_filter)]
+        st.dataframe(filtered_hist, hide_index=True, use_container_width=True)
+
+        # Export feedback history
+        csv = hist_df.to_csv(index=False).encode()
+        st.download_button("⬇️ Export Feedback History (CSV)",
+                           csv, "feedback_history.csv", "text/csv")
+
+    # ── Account management ────────────────────────────────────────────────────
+    st.divider()
+    st.markdown("### ⚙️ Account Management")
+    col_save, col_del = st.columns(2)
+    with col_save:
+        if st.button("💾 Save All Data Now", use_container_width=True):
+            _save_session_to_db()
+            st.success("✅ All data saved to database.")
+    with col_del:
+        with st.expander("🗑️ Delete My Account"):
+            st.warning("This permanently deletes your profile, feedback history, "
+                       "and all learned preferences.")
+            if st.button("Confirm Delete Account", type="primary"):
+                delete_user(uid)
+                st.session_state.current_user = None
+                st.session_state.profile      = None
+                st.session_state.adaptive     = None
+                st.session_state.feedback     = {}
+                st.rerun()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # ROUTER
 # ══════════════════════════════════════════════════════════════════════════════
 page_map = {
-    "🏠 Profile Setup":    page_profile,
-    "🎯 Job Matches":      page_matches,
-    "📄 Resume Generator": page_resume,
-    "📊 Market Analytics": page_analytics,
-    "📈 Benchmarks":       page_benchmarks,
+    "🏠 Profile Setup":       page_profile,
+    "🎯 Job Matches":         page_matches,
+    "📄 Resume Generator":    page_resume,
+    "📊 Market Analytics":    page_analytics,
+    "📈 Benchmarks":          page_benchmarks,
+    "🧠 My Learning Profile": page_learning_profile,
 }
 
 current_page = st.session_state.page
